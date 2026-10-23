@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
+import re
 from typing import Any
 import httpx
 from pydantic import ValidationError
@@ -16,10 +16,19 @@ DEFAULT_SYSTEM_PROMPT_PATH = PROMPTS_DIR / "extract_system.md"
 DEFAULT_FEWSHOT_PATH = PROMPTS_DIR / "extract_fewshot.json"
 
 
+def sanitize_hyphens(text: str) -> str:
+    """Replace em dashes and en dashes with plain hyphens or double hyphens."""
+    if not text:
+        return text
+    # Replace em-dash with double hyphen
+    # Replace en-dash with single hyphen
+    return text.replace("\u2014", "--").replace("\u2013", "-")
+
+
 def load_system_prompt() -> str:
     """Load system prompt from markdown file or fallback default."""
     if DEFAULT_SYSTEM_PROMPT_PATH.exists():
-        return DEFAULT_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
+        return sanitize_hyphens(DEFAULT_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip())
     return (
         "You extract structured memory from coding-agent transcripts. Output JSON only. "
         "Types: correction | decision | dead_end | skill_need. "
@@ -48,14 +57,41 @@ def clean_json_text(text: str) -> str:
     if not text.startswith("{"):
         start = text.find("{")
         end = text.rfind("}")
-        if start != -1 and end != -1:
+        if start != -1 and end != -1 and end > start:
             text = text[start : end + 1]
     return text
 
 
-def build_messages(window_text: str, session_id: str = "smoke-session", workspace: str | None = None) -> list[dict[str, str]]:
-    """Construct prompt messages including system instructions and window content."""
+def build_messages(
+    window_text: str,
+    session_id: str = "smoke-session",
+    workspace: str | None = None,
+    include_fewshots: bool = True,
+) -> list[dict[str, str]]:
+    """Construct prompt messages including system instructions, few-shots, and window content."""
     system_prompt = load_system_prompt()
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    if include_fewshots:
+        fewshots = load_fewshots()
+        for shot in fewshots:
+            input_text = shot.get("input_text", "")
+            shot_sess = shot.get("session_id", "example-session")
+            shot_ws = shot.get("workspace", "unknown")
+            shot_events = shot.get("expected_events", [])
+            shot_user = (
+                f"Analyze the following conversation window from session '{shot_sess}' "
+                f"(workspace: {shot_ws or 'unknown'}).\n\n"
+                f"--- CONVERSATION START ---\n"
+                f"{input_text}\n"
+                f"--- CONVERSATION END ---\n\n"
+                f"Extract all corrections, decisions, dead ends, or skill needs. "
+                f"Remember: prefer {{\"events\": []}} over guessing."
+            )
+            shot_assistant = json.dumps({"events": shot_events})
+            messages.append({"role": "user", "content": shot_user})
+            messages.append({"role": "assistant", "content": shot_assistant})
+
     user_content = (
         f"Analyze the following conversation window from session '{session_id}' "
         f"(workspace: {workspace or 'unknown'}).\n\n"
@@ -65,10 +101,8 @@ def build_messages(window_text: str, session_id: str = "smoke-session", workspac
         f"Extract all corrections, decisions, dead ends, or skill needs. "
         f"Remember: prefer {{\"events\": []}} over guessing."
     )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
+    messages.append({"role": "user", "content": user_content})
+    return messages
 
 
 def extract_events_from_text(
@@ -78,10 +112,16 @@ def extract_events_from_text(
     model: str = "gemma2:2b",
     host: str = "http://127.0.0.1:11434",
     timeout: float = 60.0,
+    include_fewshots: bool = True,
 ) -> list[ExtractedEvent]:
     """Call Ollama chat API to extract structured events from formatted text."""
     schema = ExtractResponse.model_json_schema()
-    messages = build_messages(window_text=text, session_id=session_id, workspace=workspace)
+    messages = build_messages(
+        window_text=text,
+        session_id=session_id,
+        workspace=workspace,
+        include_fewshots=include_fewshots,
+    )
 
     payload = {
         "model": model,
@@ -130,7 +170,28 @@ def extract_events_from_text(
             parsed_response = ExtractResponse.model_validate_json(retry_content)
 
         # Drop any events with confidence < 0.6 per spec
-        valid_events = [ev for ev in parsed_response.events if ev.confidence >= 0.6]
+        # Enforce plain hyphens and backfill session_id / workspace if missing
+        valid_events: list[ExtractedEvent] = []
+        for ev in parsed_response.events:
+            if ev.confidence < 0.6:
+                continue
+
+            if not ev.session_id:
+                ev.session_id = session_id
+            if not ev.workspace and workspace:
+                ev.workspace = workspace
+
+            ev.normalized = sanitize_hyphens(ev.normalized)
+            ev.quote = sanitize_hyphens(ev.quote)
+            if ev.reason:
+                ev.reason = sanitize_hyphens(ev.reason)
+            if ev.trigger:
+                ev.trigger = sanitize_hyphens(ev.trigger)
+            if ev.steps_hint:
+                ev.steps_hint = [sanitize_hyphens(step) for step in ev.steps_hint]
+
+            valid_events.append(ev)
+
         return valid_events
 
 
@@ -138,6 +199,8 @@ def extract_events_for_window(
     window: Window,
     model: str = "gemma2:2b",
     host: str = "http://127.0.0.1:11434",
+    timeout: float = 60.0,
+    include_fewshots: bool = True,
 ) -> list[ExtractedEvent]:
     """Extract events from a Window model instance."""
     return extract_events_from_text(
@@ -146,6 +209,8 @@ def extract_events_for_window(
         workspace=window.workspace,
         model=model,
         host=host,
+        timeout=timeout,
+        include_fewshots=include_fewshots,
     )
 
 
@@ -168,6 +233,7 @@ def smoke_test_ollama(
             model=model,
             host=host,
             timeout=30.0,
+            include_fewshots=False,
         )
         summary = (
             f"Successfully connected to Ollama at {host}. "
