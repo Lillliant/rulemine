@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Optional
 import typer
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from rulemine.adapters.antigravity import discover_sessions, load_turns, parse_since
+from rulemine.redact import redact_secrets
+from rulemine.store import DEFAULT_DB_PATH, init_db
+from rulemine.window import window_turns
 
 app = typer.Typer(
     name="rulemine",
@@ -21,19 +28,105 @@ def mine(
     model: str = typer.Option("gemma2:2b", help="Ollama model name"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Scan and window transcripts without calling the model"),
     workspace: Optional[str] = typer.Option(None, help="Filter transcripts by workspace directory"),
+    db_path: Path = typer.Option(DEFAULT_DB_PATH, "--db", help="Path to SQLite cache database"),
 ) -> None:
     """Mine local agent transcripts for corrections, decisions, and skill candidates."""
-    console.print(f"[bold green]RuleMine[/bold green] mining transcripts since [cyan]{since}[/cyan] using [magenta]{model}[/magenta]")
+    try:
+        since_dt = parse_since(since)
+    except ValueError as e:
+        console.print(f"[bold red]Error parsing --since option:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[bold green]RuleMine[/bold green] scanning transcripts since [cyan]{since}[/cyan]"
+        + (f" in workspace [cyan]{workspace}[/cyan]" if workspace else "")
+        + f" using [magenta]{model}[/magenta]"
+    )
+
+    sessions = discover_sessions(since=since_dt, workspace_filter=workspace)
+    if not sessions:
+        console.print("[yellow]No conversation sessions found matching criteria.[/yellow]")
+        return
+
+    table = Table(title=f"RuleMine Ingest: {len(sessions)} Discovered Sessions")
+    table.add_column("Session ID", style="cyan", no_wrap=True)
+    table.add_column("Title", style="white")
+    table.add_column("Workspace", style="green")
+    table.add_column("Turns", justify="right")
+    table.add_column("Windows", justify="right")
+    table.add_column("Redacted", justify="right")
+
+    total_turns = 0
+    total_windows = 0
+    total_redacted = 0
+
+    for session in sessions:
+        turns = load_turns(session)
+        windows = window_turns(
+            turns=turns,
+            session_id=session.session_id,
+            workspace=session.workspace,
+        )
+
+        session_redacted = sum(redact_secrets(t.content)[1] for t in turns)
+
+        total_turns += len(turns)
+        total_windows += len(windows)
+        total_redacted += session_redacted
+
+        short_id = session.session_id[:8] + "..." if len(session.session_id) > 12 else session.session_id
+        short_title = (session.title or "(untitled)")[:35]
+        ws_display = Path(session.workspace).name if session.workspace else "(none)"
+
+        table.add_row(
+            short_id,
+            short_title,
+            ws_display,
+            str(len(turns)),
+            str(len(windows)),
+            str(session_redacted),
+        )
+
+    console.print(table)
+
+    summary_text = (
+        f"[bold]Sessions:[/bold] {len(sessions)}  |  "
+        f"[bold]Turns:[/bold] {total_turns}  |  "
+        f"[bold]Windows:[/bold] {total_windows}  |  "
+        f"[bold]Secrets Redacted:[/bold] {total_redacted}"
+    )
+
     if dry_run:
-        console.print("[yellow]Dry-run mode enabled: model inference will be skipped.[/yellow]")
-    # Implementation wired in subsequent milestones
+        console.print(Panel(summary_text, title="[yellow]Dry-Run Summary[/yellow]", border_style="yellow"))
+        console.print("[yellow]Dry-run complete: no model calls or file modifications were made.[/yellow]")
+    else:
+        console.print(Panel(summary_text, title="[green]Ingest Summary[/green]", border_style="green"))
+        console.print("[blue]Ingest complete. Run with extraction in Milestone 3 to mine rules.[/blue]")
 
 
 @app.command()
-def status() -> None:
+def status(
+    db_path: Path = typer.Option(DEFAULT_DB_PATH, "--db", help="Path to SQLite cache database"),
+) -> None:
     """Show current mining cache status and proposed drafts."""
     console.print("[bold]RuleMine Status[/bold]")
-    console.print("No store found yet. Run [cyan]rulemine mine[/cyan] first.")
+    if not db_path.is_file():
+        console.print(f"No store found at {db_path}. Run [cyan]rulemine mine[/cyan] first.")
+        return
+
+    conn = init_db(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM sessions")
+    session_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM events")
+    event_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM drafts")
+    draft_count = cursor.fetchone()[0]
+
+    console.print(f"Database: [cyan]{db_path}[/cyan]")
+    console.print(f"  Sessions cached: {session_count}")
+    console.print(f"  Events extracted: {event_count}")
+    console.print(f"  Drafts stored: {draft_count}")
 
 
 @app.command()
