@@ -1,0 +1,112 @@
+[
+  {
+    "input_text": "[USER step=4]\nNo, do not use pnpm here. In this repo we strictly use npm because our CI workflow is pinned to npm lockfiles.\n[MODEL step=5]\nUnderstood, I will switch to npm and generate package-lock.json.",
+    "session_id": "sess-demo-01",
+    "step_index": 4,
+    "workspace": "/workspace/projects/RuleMine",
+    "expected_events": [
+      {
+        "type": "correction",
+        "quote": "do not use pnpm here. In this repo we strictly use npm because our CI workflow is pinned to npm lockfiles",
+        "normalized": "Use npm, not pnpm in this repository",
+        "reason": "CI workflow is pinned to npm lockfiles",
+        "confidence": 0.95,
+        "session_id": "sess-demo-01",
+        "step_index": 4,
+        "workspace": "/workspace/projects/RuleMine",
+        "timestamp": "2026-10-22T14:10:00Z",
+        "trigger": null,
+        "steps_hint": []
+      }
+    ]
+  },
+  {
+    "input_text": "[USER step=8]\nNever use em dashes or en dashes in any notes or documentation. The team's vault style guide strictly requires plain hyphens or colons.\n[MODEL step=9]\nGot it, updating the text to use plain hyphens.",
+    "session_id": "sess-demo-02",
+    "step_index": 8,
+    "workspace": "/workspace/projects/obsidian-plugins",
+    "expected_events": [
+      {
+        "type": "correction",
+        "quote": "Never use em dashes or en dashes in any notes or documentation. The team's vault style guide strictly requires plain hyphens or colons.",
+        "normalized": "Never use em dashes or en dashes in notes or documentation; use plain hyphens or colons",
+        "reason": "The team's vault style guide requires plain hyphens or colons",
+        "confidence": 0.98,
+        "session_id": "sess-demo-02",
+        "step_index": 8,
+        "workspace": "/workspace/projects/obsidian-plugins",
+        "timestamp": "2026-10-22T15:20:00Z",
+        "trigger": null,
+        "steps_hint": []
+      }
+    ]
+  },
+  {
+    "input_text": "[USER step=12]\nLet's decide on storage for large build artifacts. Should we use Google Cloud Storage or Google Drive?\n[MODEL step=13]\nI recommend Google Cloud Storage because of signed URL support and lifecycle bucket management.\n[USER step=14]\nAgreed. Let's use GCS bucket rulemine-artifacts for all build artifact storage because of signed URL access.",
+    "session_id": "sess-demo-03",
+    "step_index": 14,
+    "workspace": "/workspace/projects/RuleMine",
+    "expected_events": [
+      {
+        "type": "decision",
+        "quote": "Let's use GCS bucket rulemine-artifacts for all build artifact storage because of signed URL access.",
+        "normalized": "Store build artifacts in GCS bucket rulemine-artifacts for signed URL access",
+        "reason": "Signed URL support and lifecycle management",
+        "confidence": 0.92,
+        "session_id": "sess-demo-03",
+        "step_index": 14,
+        "workspace": "/workspace/projects/RuleMine",
+        "timestamp": "2026-10-22T16:05:00Z",
+        "trigger": null,
+        "steps_hint": []
+      }
+    ]
+  },
+  {
+    "input_text": "[USER step=18]\nDid SQLite WAL mode fix the concurrent lock issue during test suite runs?\n[MODEL step=19]\nNo, the tests are still hitting database is locked errors because multiple worker threads open connections simultaneously.\n[USER step=20]\nOkay, SQLite WAL mode in multi-process pytest runs is a dead end. Let's abandon shared SQLite during tests and use isolated in-memory databases per test worker instead.",
+    "session_id": "sess-demo-04",
+    "step_index": 20,
+    "workspace": "/workspace/projects/RuleMine",
+    "expected_events": [
+      {
+        "type": "dead_end",
+        "quote": "SQLite WAL mode in multi-process pytest runs is a dead end. Let's abandon shared SQLite during tests and use isolated in-memory databases per test worker instead.",
+        "normalized": "Avoid shared SQLite with WAL mode in multi-process pytest runs",
+        "reason": "Worker threads hit concurrent database locked errors",
+        "confidence": 0.94,
+        "session_id": "sess-demo-04",
+        "step_index": 20,
+        "workspace": "/workspace/projects/RuleMine",
+        "timestamp": "2026-10-22T16:45:00Z",
+        "trigger": null,
+        "steps_hint": []
+      }
+    ]
+  },
+  {
+    "input_text": "[USER step=24]\nEvery time we complete a feature in any repository, I need you to log the completed task with its estimated and actual time directly into the central Obsidian vault under Today's Tasks in the Daily Note, and update the project roadmap.\n[MODEL step=25]\nI will remember to log tasks to the Obsidian vault whenever a feature is completed.",
+    "session_id": "sess-demo-05",
+    "step_index": 24,
+    "workspace": "/workspace/projects/RuleMine",
+    "expected_events": [
+      {
+        "type": "skill_need",
+        "quote": "Every time we complete a feature in any repository, I need you to log the completed task with its estimated and actual time directly into the central Obsidian vault under Today's Tasks in the Daily Note, and update the project roadmap.",
+        "normalized": "vault-task-logger",
+        "reason": "Recurring cross-repository workflow to record completed tasks into central Obsidian Daily Notes and roadmaps",
+        "confidence": 0.96,
+        "session_id": "sess-demo-05",
+        "step_index": 24,
+        "workspace": "/workspace/projects/RuleMine",
+        "timestamp": "2026-10-22T17:15:00Z",
+        "trigger": "When completing a feature, bug fix, or milestone in any workspace",
+        "steps_hint": [
+          "Locate today's daily note in Obsidian vault",
+          "Render Templater daily note if missing",
+          "Append task under Today's Tasks in Obsidian Tasks syntax",
+          "Update corresponding project progress roadmap"
+        ]
+      }
+    ]
+  }
+]
