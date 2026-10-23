@@ -66,6 +66,11 @@ class RuleDraft(BaseModel):
     source_event_ids: list[str] = Field(default_factory=list)
     status: ReviewStatus = "proposed"
 
+    @property
+    def draft_id(self) -> str:
+        key = f"rule|{self.text}"
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
 
 class DecisionDraft(BaseModel):
     text: str
@@ -73,8 +78,15 @@ class DecisionDraft(BaseModel):
     reason: str | None = None
     git_sha: str | None = None
     workspace: str | None = None
+    timestamp: str | None = None
+    session_id: str | None = None
     source_event_ids: list[str] = Field(default_factory=list)
     status: ReviewStatus = "proposed"
+
+    @property
+    def draft_id(self) -> str:
+        key = f"{self.kind}|{self.text}"
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
 class SkillCandidate(BaseModel):
@@ -87,3 +99,8 @@ class SkillCandidate(BaseModel):
     source_event_ids: list[str] = Field(default_factory=list)
     overlaps_existing: list[str] = Field(default_factory=list)
     status: ReviewStatus = "proposed"
+
+    @property
+    def draft_id(self) -> str:
+        key = f"skill|{self.name}"
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]

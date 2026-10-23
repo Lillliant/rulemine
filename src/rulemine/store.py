@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any
 
-from rulemine.models import ExtractedEvent
+from rulemine.models import DecisionDraft, ExtractedEvent, RuleDraft, SkillCandidate
 
 DEFAULT_DB_PATH = Path("out/rulemine.sqlite")
 
@@ -288,6 +289,149 @@ def get_store_stats(
             "events_by_type": events_by_type,
             "last_mined_at": last_mined_at,
         }
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def save_drafts(
+    drafts: list[RuleDraft | DecisionDraft | SkillCandidate],
+    db_path: Path | str = DEFAULT_DB_PATH,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Persist drafts into the drafts table."""
+    if not drafts:
+        return 0
+
+    close_conn = False
+    if conn is None:
+        conn = init_db(db_path)
+        close_conn = True
+
+    count = 0
+    try:
+        with conn:
+            cursor = conn.cursor()
+            for d in drafts:
+                d_id = d.draft_id
+                kind = "rule" if isinstance(d, RuleDraft) else (d.kind if isinstance(d, DecisionDraft) else "skill")
+
+                # Check existing status if already in DB to avoid clobbering user reviews
+                cursor.execute("SELECT status FROM drafts WHERE draft_id = ?", (d_id,))
+                row = cursor.fetchone()
+                if row:
+                    existing_status = row["status"] if isinstance(row, sqlite3.Row) else row[0]
+                    status_to_use = existing_status
+                else:
+                    status_to_use = d.status
+
+                dump_dict = d.model_dump()
+                dump_dict["status"] = status_to_use
+                json_data = json.dumps(dump_dict)
+
+                conn.execute(
+                    """
+                    INSERT INTO drafts (draft_id, kind, data, status)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(draft_id) DO UPDATE SET
+                        kind = excluded.kind,
+                        data = excluded.data,
+                        status = excluded.status
+                    """,
+                    (d_id, kind, json_data, status_to_use),
+                )
+                count += 1
+    finally:
+        if close_conn:
+            conn.close()
+    return count
+
+
+def get_drafts(
+    kind: str | None = None,
+    status: str | None = None,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve drafts filtered by kind and/or status."""
+    close_conn = False
+    if conn is None:
+        if isinstance(db_path, (str, Path)) and str(db_path) != ":memory:" and not Path(db_path).exists():
+            return []
+        conn = init_db(db_path)
+        close_conn = True
+
+    try:
+        query = "SELECT draft_id, kind, data, status FROM drafts WHERE 1=1"
+        params: list[Any] = []
+        if kind:
+            if kind in ("decisions", "decision"):
+                query += " AND kind IN ('decision', 'dead_end')"
+            elif kind in ("rules", "rule"):
+                query += " AND kind = 'rule'"
+            elif kind in ("skills", "skill"):
+                query += " AND kind = 'skill'"
+            else:
+                query += " AND kind = ?"
+                params.append(kind)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+
+        query += " ORDER BY draft_id ASC"
+
+        cursor = conn.cursor()
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+        drafts: list[dict[str, Any]] = []
+        for row in rows:
+            draft_id = row["draft_id"] if isinstance(row, sqlite3.Row) else row[0]
+            row_kind = row["kind"] if isinstance(row, sqlite3.Row) else row[1]
+            raw_data = row["data"] if isinstance(row, sqlite3.Row) else row[2]
+            row_status = row["status"] if isinstance(row, sqlite3.Row) else row[3]
+            data = json.loads(raw_data)
+            data["draft_id"] = draft_id
+            data["kind"] = row_kind
+            data["status"] = row_status
+            drafts.append(data)
+        return drafts
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def update_draft_status(
+    draft_id: str,
+    status: str,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Update review status of a draft."""
+    close_conn = False
+    if conn is None:
+        if isinstance(db_path, (str, Path)) and str(db_path) != ":memory:" and not Path(db_path).exists():
+            return False
+        conn = init_db(db_path)
+        close_conn = True
+
+    try:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT data FROM drafts WHERE draft_id = ?", (draft_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+
+            raw_data = row["data"] if isinstance(row, sqlite3.Row) else row[0]
+            data = json.loads(raw_data)
+            data["status"] = status
+            json_data = json.dumps(data)
+
+            cursor.execute(
+                "UPDATE drafts SET status = ?, data = ? WHERE draft_id = ?",
+                (status, json_data, draft_id),
+            )
+            return cursor.rowcount > 0
     finally:
         if close_conn:
             conn.close()

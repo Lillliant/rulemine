@@ -1,16 +1,19 @@
 """Unit tests for SQLite persistence store."""
 
 from pathlib import Path
-from rulemine.models import ExtractedEvent
+from rulemine.models import DecisionDraft, ExtractedEvent, RuleDraft, SkillCandidate
 from rulemine.store import (
     compute_transcript_hash,
+    get_drafts,
     get_events,
     get_session,
     get_store_stats,
     init_db,
+    save_drafts,
     save_events,
     save_session,
     should_remine,
+    update_draft_status,
 )
 
 
@@ -202,3 +205,66 @@ def test_get_store_stats(tmp_path: Path):
     assert stats["events_by_type"]["decision"] == 1
     assert stats["events_by_type"]["dead_end"] == 0
     assert stats["events_by_type"]["skill_need"] == 0
+
+
+def test_save_get_and_update_drafts(tmp_path: Path):
+    db_file = tmp_path / "drafts_test.sqlite"
+
+    rule = RuleDraft(
+        text="Use plain hyphens, never em dashes",
+        support_count=2,
+        workspaces=["/workspace/repo1"],
+        source_event_ids=["ev1", "ev2"],
+    )
+    decision = DecisionDraft(
+        text="Use SQLite for local caching",
+        kind="decision",
+        reason="Zero config, no daemon required",
+        git_sha="abcdef1",
+        workspace="/workspace/repo1",
+        source_event_ids=["ev3"],
+    )
+    skill = SkillCandidate(
+        name="log-task-to-obsidian",
+        description="Automate task logging to central vault.",
+        trigger="When a task milestone is completed.",
+        support_count=3,
+        workspaces=["/workspace/repo1", "/workspace/repo2"],
+        source_event_ids=["ev4", "ev5", "ev6"],
+    )
+
+    # Save drafts
+    count = save_drafts([rule, decision, skill], db_path=db_file)
+    assert count == 3
+
+    # Retrieve all drafts
+    all_drafts = get_drafts(db_path=db_file)
+    assert len(all_drafts) == 3
+
+    # Filter by kind
+    rule_drafts = get_drafts(kind="rule", db_path=db_file)
+    assert len(rule_drafts) == 1
+    assert rule_drafts[0]["text"] == "Use plain hyphens, never em dashes"
+    assert rule_drafts[0]["status"] == "proposed"
+
+    decision_drafts = get_drafts(kind="decision", db_path=db_file)
+    assert len(decision_drafts) == 1
+    assert decision_drafts[0]["text"] == "Use SQLite for local caching"
+
+    skill_drafts = get_drafts(kind="skill", db_path=db_file)
+    assert len(skill_drafts) == 1
+    assert skill_drafts[0]["name"] == "log-task-to-obsidian"
+
+    # Update status
+    r_id = rule.draft_id
+    success = update_draft_status(r_id, "approved", db_path=db_file)
+    assert success is True
+
+    approved_drafts = get_drafts(status="approved", db_path=db_file)
+    assert len(approved_drafts) == 1
+    assert approved_drafts[0]["draft_id"] == r_id
+
+    # Re-saving existing approved draft preserves approved status
+    save_drafts([rule], db_path=db_file)
+    updated_draft = get_drafts(kind="rule", db_path=db_file)[0]
+    assert updated_draft["status"] == "approved"
