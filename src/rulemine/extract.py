@@ -362,7 +362,7 @@ def smoke_test_ollama(
         )
         summary = (
             f"Successfully connected to Ollama at {host}. "
-            f"Model {model} returned {len(events)} event(s):\n"
+            f"Model [bold cyan]{model}[/bold cyan] returned {len(events)} event(s):\n"
             + json.dumps([e.model_dump() for e in events], indent=2)
         )
         return True, summary
