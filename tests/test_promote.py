@@ -228,3 +228,7 @@ def test_promote_skills_heuristics(tmp_path: Path):
     promoted_with_overlap = promote_skills([ev_strong], existing_skills_dir=skills_dir)
     assert len(promoted_with_overlap) == 1
     assert "cut-release-and-update-changelog" in promoted_with_overlap[0].overlaps_existing
+
+    # 4. Filter by min_support or min_workspaces
+    assert len(promote_skills([ev_strong], min_support=2)) == 0
+    assert len(promote_skills([ev_strong], min_workspaces=2)) == 0

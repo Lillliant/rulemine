@@ -2,13 +2,17 @@
 
 import json
 from unittest.mock import MagicMock, patch
+import httpx
+import pytest
 from rulemine.extract import (
     build_messages,
     extract_events_for_window,
     extract_events_from_text,
+    has_extraction_signals,
     load_fewshots,
     load_system_prompt,
     sanitize_hyphens,
+    stream_chat_from_ollama,
 )
 from rulemine.models import ExtractedEvent, Window
 
@@ -130,3 +134,72 @@ def test_extract_events_for_window():
         assert events[0].type == "correction"
         assert events[0].session_id == "win-session"
         assert events[0].workspace == "/my/project"
+
+
+def test_stream_chat_from_ollama_chunk_aggregation():
+    mock_client = MagicMock()
+    # Explicitly remove post mock so it tests the streaming branch
+    del mock_client.post
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.iter_lines.return_value = [
+        json.dumps({"message": {"content": '{"events": ['}}),
+        json.dumps({"message": {"content": '{"type": "decision", "normalized": "Use SQLite", '}}),
+        json.dumps({"message": {"content": '"confidence": 0.95}'}}),
+        json.dumps({"message": {"content": ']}'}}),
+    ]
+    mock_client.stream.return_value.__enter__.return_value = mock_response
+
+    payload = {"model": "gemma2:2b", "messages": []}
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
+    result = stream_chat_from_ollama(mock_client, payload, timeout=timeout)
+    assert '{"events": [{"type": "decision", "normalized": "Use SQLite", "confidence": 0.95}]}' in result
+
+
+def test_stream_chat_from_ollama_wall_clock_timeout():
+    mock_client = MagicMock()
+    del mock_client.post
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    def slow_lines():
+        import time
+        time.sleep(0.04)
+        yield json.dumps({"message": {"content": "chunk1"}})
+        time.sleep(0.04)
+        yield json.dumps({"message": {"content": "chunk2"}})
+
+    mock_response.iter_lines.side_effect = slow_lines
+    mock_client.stream.return_value.__enter__.return_value = mock_response
+
+    payload = {"model": "gemma2:2b", "messages": []}
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
+    with pytest.raises(httpx.ReadTimeout, match="maximum wall-clock ceiling"):
+        stream_chat_from_ollama(mock_client, payload, timeout=timeout, max_wall_time=0.03)
+
+
+def test_has_extraction_signals():
+    # True positives: corrections, decisions, dead ends, skills
+    assert has_extraction_signals("No, please do not use pnpm here.") is True
+    assert has_extraction_signals("Let's decide on PostgreSQL rather than MongoDB.") is True
+    assert has_extraction_signals("That approach is a dead end, let's revert.") is True
+    assert has_extraction_signals("Every time we build, run this workflow.") is True
+
+    # True negatives: mundane banter, tool reads, simple commands
+    assert has_extraction_signals("Can you read src/app.py?") is False
+    assert has_extraction_signals("Here are the file contents:\nimport sys\nprint('hello')") is False
+    assert has_extraction_signals("Committed changes. Looks good, thanks.") is False
+
+
+def test_extract_events_for_window_filters_signals():
+    boring_win = Window(
+        session_id="win-boring",
+        workspace="/test",
+        start_step=0,
+        end_step=1,
+        text="[USER step=0]\nCan you read src/app.py?\n[MODEL step=1]\nSure, reading file.",
+        turn_count=2,
+    )
+    # Should skip immediately without calling LLM (no mock needed)
+    events = extract_events_for_window(boring_win, filter_signals=True)
+    assert events == []

@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import httpx
 from typer.testing import CliRunner
 
 from rulemine.cli import app
@@ -139,3 +140,105 @@ def test_cli_mine_live_mocked(tmp_path: Path):
         assert result2.exit_code == 0
         assert "Cached / Skipped: 1 session(s)" in result2.output
         assert "Newly Mined: 0 session(s)" in result2.output
+
+
+def test_cli_mine_timeout_error(tmp_path: Path):
+    db_file = tmp_path / "timeout.sqlite"
+
+    with patch("httpx.Client.post", side_effect=httpx.ReadTimeout("timed out")):
+        result = runner.invoke(
+            app,
+            [
+                "mine",
+                "--base-dir",
+                "fixtures/antigravity",
+                "--since",
+                "7d",
+                "--db",
+                str(db_file),
+                "--timeout",
+                "30",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "Ollama request timed out after 30s" in result.output
+        assert "rulemine mine --timeout" in result.output
+
+
+def test_cli_mine_timeout_continue_on_error(tmp_path: Path):
+    db_file = tmp_path / "continue_error.sqlite"
+
+    with patch("httpx.Client.post", side_effect=httpx.ReadTimeout("timed out")):
+        result = runner.invoke(
+            app,
+            [
+                "mine",
+                "--base-dir",
+                "fixtures/antigravity",
+                "--since",
+                "7d",
+                "--db",
+                str(db_file),
+                "--continue-on-error",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "timed out after" in result.output
+        assert "Mining Summary" in result.output
+
+
+def test_cli_mine_quick_mode():
+    result = runner.invoke(
+        app,
+        [
+            "mine",
+            "--base-dir",
+            "fixtures/antigravity",
+            "--since",
+            "7d",
+            "--dry-run",
+            "--quick",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Discovered Session(s)" in result.output
+
+
+def test_cli_promote_workspace_and_decision_support(tmp_path: Path):
+    db_file = tmp_path / "filter_promo.sqlite"
+    conn = init_db(db_file)
+    ev1 = ExtractedEvent(
+        type="decision",
+        quote="Use SQLite",
+        normalized="Use SQLite for local metadata",
+        confidence=0.9,
+        session_id="sess-ws-1",
+        workspace="/workspace/repoA",
+    )
+    ev2 = ExtractedEvent(
+        type="decision",
+        quote="Use SQLite",
+        normalized="Use SQLite for local metadata",
+        confidence=0.95,
+        session_id="sess-ws-2",
+        workspace="/workspace/repoA",
+    )
+    ev3 = ExtractedEvent(
+        type="decision",
+        quote="Use Postgres",
+        normalized="Use Postgres in cloud",
+        confidence=0.9,
+        session_id="sess-ws-3",
+        workspace="/workspace/repoB",
+    )
+    save_events([ev1, ev2, ev3], conn=conn)
+
+    # 1. Promote with workspace filter
+    res = runner.invoke(app, ["promote", "--db", str(db_file), "--workspace", "/workspace/repoA"])
+    assert res.exit_code == 0
+    assert "Filtered to 2 event(s)" in res.output
+
+    # 2. Review filter by kind
+    review_res = runner.invoke(app, ["review", "--db", str(db_file), "--kind", "decision", "--all"])
+    assert review_res.exit_code == 0
+    assert "Approved all" in review_res.output

@@ -12,6 +12,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from rich.table import Table
 
 from rulemine.adapters.antigravity import discover_sessions, load_turns, parse_since
+from rulemine.adapters.cursor import discover_cursor_sessions
 from rulemine.extract import extract_events_for_window
 from rulemine.models import DecisionDraft, ExtractedEvent, RuleDraft, SkillCandidate
 from rulemine.promote import promote_corrections, promote_decisions, promote_skills
@@ -49,7 +50,14 @@ def mine(
     limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Limit number of sessions to process"),
     db_path: Path = typer.Option(DEFAULT_DB_PATH, "--db", help="Path to SQLite cache database"),
     host: str = typer.Option("http://127.0.0.1:11434", "--host", help="Ollama host URL"),
-    base_dir: Optional[Path] = typer.Option(None, "--base-dir", help="Base directory for Antigravity sessions"),
+    base_dir: Optional[Path] = typer.Option(None, "--base-dir", help="Base directory for agent session logs"),
+    adapter: str = typer.Option("auto", "--adapter", "-a", help="Agent adapter: 'antigravity', 'cursor', or 'auto'/'all'"),
+    timeout: float = typer.Option(180.0, "--timeout", "-t", help="Ollama socket read / idle timeout in seconds (default: 180s)"),
+    continue_on_error: bool = typer.Option(False, "--continue-on-error", help="Skip failing sessions and continue mining remaining sessions"),
+    keep_alive: str = typer.Option("30m", "--keep-alive", help="Ollama model keep-alive in memory (e.g. 30m, 1h)"),
+    quick: bool = typer.Option(False, "--quick", "-q", help="Fast demo mode: process only top 3 sessions with compact few-shots"),
+    no_filter: bool = typer.Option(False, "--no-filter", help="Disable candidate gating and send all windows to LLM"),
+    max_fewshots: int = typer.Option(2, "--max-fewshots", help="Maximum few-shot examples in prompt (default: 2)"),
 ) -> None:
     """Mine local agent transcripts for corrections, decisions, and skill candidates."""
     try:
@@ -62,12 +70,39 @@ def mine(
         f"[bold green]RuleMine[/bold green] scanning transcripts since [cyan]{since}[/cyan]"
         + (f" in workspace [cyan]{workspace}[/cyan]" if workspace else "")
         + f" using [magenta]{model}[/magenta]"
+        + (f" via adapter [yellow]{adapter}[/yellow]" if adapter != "auto" else "")
     )
 
-    sessions = discover_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir)
+    # Resolve sessions based on adapter selection
+    sessions: list[SessionRef] = []
+    adapter_lower = adapter.lower()
+
+    if adapter_lower == "cursor":
+        sessions = discover_cursor_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir)
+    elif adapter_lower == "antigravity":
+        sessions = discover_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir)
+    else:  # "auto" or "all"
+        if base_dir:
+            if (base_dir / "brain").is_dir() or (base_dir / "conversation_summaries.db").is_file():
+                sessions.extend(discover_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir))
+            elif (base_dir / "workspaceStorage").is_dir() or (base_dir / "globalStorage").is_dir() or base_dir.name == "state.vscdb":
+                sessions.extend(discover_cursor_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir))
+            else:
+                sessions.extend(discover_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir))
+                sessions.extend(discover_cursor_sessions(since=since_dt, workspace_filter=workspace, base_dir=base_dir))
+        else:
+            sessions.extend(discover_sessions(since=since_dt, workspace_filter=workspace))
+            sessions.extend(discover_cursor_sessions(since=since_dt, workspace_filter=workspace))
+
+    # Sort combined sessions descending by mtime
+    sessions.sort(key=lambda s: s.mtime or 0.0, reverse=True)
     if not sessions:
         console.print("[yellow]No conversation sessions found matching criteria.[/yellow]")
         return
+
+    if quick and not limit:
+        limit = 3
+        max_fewshots = 1
 
     if limit and limit > 0:
         sessions = sessions[:limit]
@@ -140,71 +175,122 @@ def mine(
 
     console.print(f"Checking cache in [cyan]{db_path}[/cyan]...")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(f"Mining {len(sessions)} session(s)...", total=len(sessions))
+    timeout_config = httpx.Timeout(
+        connect=10.0,
+        read=timeout,
+        write=10.0,
+        pool=10.0,
+    )
 
-        for session in sessions:
-            content_hash = compute_transcript_hash(session.transcript_path)
+    with httpx.Client(base_url=host, timeout=timeout_config) as client:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"Mining {len(sessions)} session(s)...", total=len(sessions))
 
-            if not should_remine(conn, session.session_id, content_hash, model=model):
-                sessions_skipped += 1
-                progress.advance(task)
-                continue
+            for session in sessions:
+                content_hash = compute_transcript_hash(session.transcript_path)
 
-            turns = load_turns(session)
-            windows = window_turns(
-                turns=turns,
-                session_id=session.session_id,
-                workspace=session.workspace,
-            )
+                if not should_remine(conn, session.session_id, content_hash, model=model):
+                    sessions_skipped += 1
+                    progress.advance(task)
+                    continue
 
-            session_events: list[ExtractedEvent] = []
-            try:
-                for win in windows:
-                    extracted = extract_events_for_window(
-                        window=win,
-                        model=model,
-                        host=host,
-                    )
-                    for ev in extracted:
-                        if not ev.workspace and session.workspace:
-                            ev.workspace = session.workspace
-                        session_events.append(ev)
-                        events_by_type[ev.type] = events_by_type.get(ev.type, 0) + 1
-            except httpx.ConnectError:
-                progress.stop()
-                console.print(
-                    f"\n[bold red]Error connecting to Ollama at {host}:[/bold red] "
-                    f"Ensure Ollama is running ('ollama serve') and model '{model}' is installed."
+                turns = load_turns(session)
+                windows = window_turns(
+                    turns=turns,
+                    session_id=session.session_id,
+                    workspace=session.workspace,
                 )
-                raise typer.Exit(code=1)
-            except httpx.HTTPError as http_err:
-                progress.stop()
-                console.print(f"\n[bold red]HTTP error calling Ollama:[/bold red] {http_err}")
-                raise typer.Exit(code=1)
 
-            # Persist extracted events and update session cache
-            if session_events:
-                save_events(session_events, conn=conn)
-                all_new_events.extend(session_events)
+                session_events: list[ExtractedEvent] = []
+                session_failed = False
+                try:
+                    for win in windows:
+                        extracted = extract_events_for_window(
+                            window=win,
+                            model=model,
+                            host=host,
+                            timeout=timeout,
+                            keep_alive=keep_alive,
+                            max_fewshots=max_fewshots,
+                            client=client,
+                            filter_signals=not no_filter,
+                        )
+                        for ev in extracted:
+                            if not ev.workspace and session.workspace:
+                                ev.workspace = session.workspace
+                            session_events.append(ev)
+                            events_by_type[ev.type] = events_by_type.get(ev.type, 0) + 1
+                except httpx.ConnectError:
+                    progress.stop()
+                    console.print(
+                        f"\n[bold red]Error connecting to Ollama at {host}:[/bold red] "
+                        f"Ensure Ollama is running ('ollama serve') and model '{model}' is installed."
+                    )
+                    raise typer.Exit(code=1)
+                except httpx.TimeoutException as timeout_err:
+                    if continue_on_error:
+                        session_failed = True
+                        console.print(
+                            f"\n[yellow]Warning: session {session.session_id} timed out after {timeout:.0f}s, skipping...[/yellow]"
+                        )
+                    else:
+                        progress.stop()
+                        console.print(
+                            f"\n[bold red]Ollama request timed out after {timeout:.0f}s[/bold red] while processing session [cyan]{session.session_id}[/cyan].\n\n"
+                            f"[bold yellow]How to fix:[/bold yellow]\n"
+                            f"  1. Increase the timeout: [cyan]rulemine mine --timeout {int(timeout * 2)}[/cyan]\n"
+                            f"  2. Skip slow sessions and continue: [cyan]rulemine mine --continue-on-error[/cyan]\n"
+                            f"  3. Check Ollama server load or GPU availability.\n\n"
+                            f"[dim]Note: Already mined sessions ({sessions_mined} in this run, {sessions_skipped} cached) are saved in {db_path} and will not be re-mined.[/dim]"
+                        )
+                        raise typer.Exit(code=1)
+                except httpx.HTTPError as http_err:
+                    if continue_on_error:
+                        session_failed = True
+                        console.print(
+                            f"\n[yellow]Warning: session {session.session_id} encountered HTTP error ({http_err}), skipping...[/yellow]"
+                        )
+                    else:
+                        progress.stop()
+                        console.print(f"\n[bold red]HTTP error calling Ollama:[/bold red] {http_err}")
+                        raise typer.Exit(code=1)
+                except Exception as err:
+                    if continue_on_error:
+                        session_failed = True
+                        console.print(
+                            f"\n[yellow]Warning: session {session.session_id} encountered error ({err}), skipping...[/yellow]"
+                        )
+                    else:
+                        progress.stop()
+                        console.print(f"\n[bold red]Error processing session {session.session_id}:[/bold red] {err}")
+                        raise typer.Exit(code=1)
 
-            save_session(
-                conn=conn,
-                session_id=session.session_id,
-                transcript_path=session.transcript_path,
-                content_hash=content_hash,
-                workspace=session.workspace,
-                title=session.title,
-                model=model,
-            )
-            sessions_mined += 1
-            progress.advance(task)
+                if session_failed:
+                    progress.advance(task)
+                    continue
+
+                # Persist extracted events and update session cache
+                if session_events:
+                    save_events(session_events, conn=conn)
+                    all_new_events.extend(session_events)
+
+                save_session(
+                    conn=conn,
+                    session_id=session.session_id,
+                    transcript_path=session.transcript_path,
+                    content_hash=content_hash,
+                    workspace=session.workspace,
+                    title=session.title,
+                    model=model,
+                )
+                sessions_mined += 1
+                progress.advance(task)
 
     # Post-run summary
     summary_lines = [
@@ -281,7 +367,12 @@ def status(
 
 @app.command()
 def promote(
-    min_support: int = typer.Option(2, "--min-support", help="Minimum occurrences to promote a correction to a rule"),
+    min_support: int = typer.Option(2, "--min-support", help="Minimum occurrences across sessions to promote a correction to a rule"),
+    min_skill_support: int = typer.Option(1, "--min-skill-support", help="Minimum occurrences across sessions to promote a skill candidate"),
+    min_workspaces: int = typer.Option(1, "--min-workspaces", help="Minimum distinct workspaces to promote a skill candidate"),
+    min_decision_support: int = typer.Option(1, "--min-decision-support", help="Minimum occurrences across sessions to promote a decision/dead_end"),
+    require_reason: bool = typer.Option(False, "--require-reason", help="Only promote decisions with an explicit rationale"),
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Filter events to a specific workspace directory (e.g. . for current repo)"),
     db_path: Path = typer.Option(DEFAULT_DB_PATH, "--db", help="Path to SQLite cache database"),
 ) -> None:
     """Cluster extracted events into proposed rules, decisions, and skills."""
@@ -294,11 +385,30 @@ def promote(
         console.print("[yellow]No extracted events found in database.[/yellow] Run [cyan]rulemine mine[/cyan] first.")
         return
 
+    if workspace:
+        target_path = Path(workspace).resolve()
+
+        def _matches_workspace(ev_ws: str | None) -> bool:
+            if not ev_ws:
+                return False
+            p = Path(ev_ws).resolve()
+            return p == target_path or p in target_path.parents or target_path in p.parents or p.name == target_path.name
+
+        events = [e for e in events if _matches_workspace(e.workspace)]
+        console.print(f"Filtered to [cyan]{len(events)}[/cyan] event(s) matching workspace [cyan]{workspace}[/cyan]")
+        if not events:
+            console.print("[yellow]No matching events found for workspace.[/yellow]")
+            return
+
     console.print(f"Running promotion algorithms on [cyan]{len(events)}[/cyan] extracted event(s)...")
 
     rules = promote_corrections(events, min_support=min_support)
-    decisions = promote_decisions(events)
-    skills = promote_skills(events)
+    decisions = promote_decisions(
+        events,
+        min_support=min_decision_support,
+        require_reason=require_reason,
+    )
+    skills = promote_skills(events, min_support=min_skill_support, min_workspaces=min_workspaces)
 
     all_drafts: list[RuleDraft | DecisionDraft | SkillCandidate] = list(rules) + list(decisions) + list(skills)
     save_drafts(all_drafts, db_path=db_path)
@@ -353,6 +463,7 @@ def promote(
 
 @app.command()
 def review(
+    kind: Optional[str] = typer.Option(None, "--kind", "-k", help="Filter review to a specific kind: 'skill', 'rule', or 'decision'"),
     all: bool = typer.Option(False, "--all", "-a", help="Approve all proposed drafts without interactive prompts"),
     db_path: Path = typer.Option(DEFAULT_DB_PATH, "--db", help="Path to SQLite cache database"),
 ) -> None:
@@ -365,6 +476,18 @@ def review(
     if not proposed:
         console.print("[yellow]No pending drafts to review.[/yellow] Run [cyan]rulemine promote[/cyan] to discover candidates.")
         return
+
+    if kind:
+        kind_clean = kind.lower().strip()
+        if kind_clean in ("skill", "skills"):
+            proposed = [d for d in proposed if d["kind"] == "skill"]
+        elif kind_clean in ("rule", "rules"):
+            proposed = [d for d in proposed if d["kind"] == "rule"]
+        elif kind_clean in ("decision", "decisions", "dead_end", "dead_ends"):
+            proposed = [d for d in proposed if d["kind"] in ("decision", "dead_end")]
+        if not proposed:
+            console.print(f"[yellow]No pending drafts of kind '{kind}' found to review.[/yellow]")
+            return
 
     if all:
         for d in proposed:
@@ -527,12 +650,13 @@ def write_drafts(
 def smoke(
     model: str = typer.Option("gemma2:2b", help="Ollama model name to smoke-test"),
     host: str = typer.Option("http://127.0.0.1:11434", help="Ollama host URL"),
+    timeout: float = typer.Option(60.0, "--timeout", "-t", help="Ollama request timeout in seconds"),
 ) -> None:
     """Smoke-test Ollama structured JSON extraction with local Gemma."""
     from rulemine.extract import smoke_test_ollama
 
     console.print(f"[bold cyan]Running Ollama smoke test on {host} using {model}...[/bold cyan]")
-    success, details = smoke_test_ollama(model=model, host=host)
+    success, details = smoke_test_ollama(model=model, host=host, timeout=timeout)
     if success:
         console.print("[bold green]✓ Smoke test passed![/bold green]")
         console.print(details)

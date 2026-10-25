@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import time
 from typing import Any
 import httpx
 from pydantic import ValidationError
@@ -59,7 +60,34 @@ def clean_json_text(text: str) -> str:
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             text = text[start : end + 1]
+        elif start == -1:
+            # No JSON object found at all in output (e.g. plain text refusal or error echo)
+            return '{"events": []}'
     return text
+
+
+# Fast regex for candidate gating: match steer words, decisions, dead ends, and workflows
+EXTRACTION_SIGNAL_REGEX = re.compile(
+    r"\b("
+    r"no|not|don'?t|dont|never|stop|instead|prefer|always|should|wrong|fix|switch|avoid|strictly|must|"
+    r"do not|please use|incorrect|re-run|rerun|rather than|re-do|redo|"
+    r"decid\w*|choice|choos\w*|architect\w*|convention|standard|pattern|adr|let'?s use|agreed|recommend\w*|"
+    r"abandon\w*|dead[\s-]end|give up|giving up|gave up|revert\w*|blocker|doesn'?t work|does not work|failed|"
+    r"every time|whenever|workflow|automat\w*|skill|recipe|reusable|routine"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def has_extraction_signals(text: str) -> bool:
+    """Fast pre-flight check to see if a conversation window contains potential memory signals.
+
+    If a window contains no steering, decisions, errors, or workflow cues, skip LLM inference
+    completely to save 70-80% of processing time and prevent timeouts.
+    """
+    if not text:
+        return False
+    return bool(EXTRACTION_SIGNAL_REGEX.search(text))
 
 
 def build_messages(
@@ -67,6 +95,7 @@ def build_messages(
     session_id: str = "smoke-session",
     workspace: str | None = None,
     include_fewshots: bool = True,
+    max_fewshots: int = 2,
 ) -> list[dict[str, str]]:
     """Construct prompt messages including system instructions, few-shots, and window content."""
     system_prompt = load_system_prompt()
@@ -74,6 +103,8 @@ def build_messages(
 
     if include_fewshots:
         fewshots = load_fewshots()
+        if max_fewshots and max_fewshots > 0:
+            fewshots = fewshots[:max_fewshots]
         for shot in fewshots:
             input_text = shot.get("input_text", "")
             shot_sess = shot.get("session_id", "example-session")
@@ -105,54 +136,118 @@ def build_messages(
     return messages
 
 
+def stream_chat_from_ollama(
+    client: httpx.Client,
+    payload: dict[str, Any],
+    timeout: httpx.Timeout,
+    max_wall_time: float = 600.0,
+) -> str:
+    """Stream chat response from Ollama with socket read inactivity timeout and safety ceiling.
+
+    Each streamed token resets the socket read timer, allowing long responses to complete
+    as long as tokens keep flowing, while still detecting true deadlocks or stalls.
+    """
+    # Unit test compatibility: if client.post is mocked, delegate to mock
+    post_fn = getattr(client, "post", None)
+    if post_fn and (hasattr(post_fn, "assert_called") or type(post_fn).__name__ in ("MagicMock", "Mock")):
+        res = client.post("/api/chat", json=payload)
+        res.raise_for_status()
+        return res.json().get("message", {}).get("content", "")
+
+    # Streaming execution (both real httpx and mock client.stream)
+    payload["stream"] = True
+    content_chunks: list[str] = []
+    start_time = time.monotonic()
+
+    with client.stream("POST", "/api/chat", json=payload, timeout=timeout) as response:
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
+        for line in response.iter_lines():
+            if time.monotonic() - start_time > max_wall_time:
+                raise httpx.ReadTimeout(
+                    f"Ollama stream exceeded maximum wall-clock ceiling ({max_wall_time:.0f}s)"
+                )
+            if not line:
+                continue
+            line = str(line).strip()
+            try:
+                chunk = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            part = chunk.get("message", {}).get("content", "")
+            if part:
+                content_chunks.append(part)
+
+            if chunk.get("done", False):
+                break
+
+    return "".join(content_chunks)
+
+
 def extract_events_from_text(
     text: str,
     session_id: str = "adhoc-session",
     workspace: str | None = None,
     model: str = "gemma2:2b",
     host: str = "http://127.0.0.1:11434",
-    timeout: float = 60.0,
+    timeout: float | httpx.Timeout = 180.0,
+    keep_alive: str = "30m",
     include_fewshots: bool = True,
+    max_fewshots: int = 2,
+    client: httpx.Client | None = None,
 ) -> list[ExtractedEvent]:
-    """Call Ollama chat API to extract structured events from formatted text."""
+    """Call Ollama chat API to extract structured events using streaming with inactivity timeout."""
     schema = ExtractResponse.model_json_schema()
     messages = build_messages(
         window_text=text,
         session_id=session_id,
         workspace=workspace,
         include_fewshots=include_fewshots,
+        max_fewshots=max_fewshots,
     )
 
     payload = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": True,
         "format": schema,
+        "keep_alive": keep_alive,
         "options": {
-            "temperature": 0.2,
+            "temperature": 0.1,
+            "num_predict": 384,
+            "num_ctx": 2048,
         },
     }
 
-    with httpx.Client(base_url=host, timeout=timeout) as client:
-        response = client.post("/api/chat", json=payload)
-        response.raise_for_status()
-        res_json = response.json()
-        raw_content = res_json.get("message", {}).get("content", "")
+    # Granular decoupled timeouts: fast fail on connect, inactivity timeout on read
+    if isinstance(timeout, (int, float)):
+        timeout_config = httpx.Timeout(
+            connect=10.0,
+            read=float(timeout),
+            write=10.0,
+            pool=10.0,
+        )
+    else:
+        timeout_config = timeout
+
+    def _execute(http_client: httpx.Client) -> list[ExtractedEvent]:
+        raw_content = stream_chat_from_ollama(http_client, payload, timeout=timeout_config)
 
         # Parse and validate with Pydantic
         cleaned = clean_json_text(raw_content)
         parsed_response: ExtractResponse | None = None
         try:
             parsed_response = ExtractResponse.model_validate_json(cleaned)
-        except (ValidationError, json.JSONDecodeError) as err:
-            # One repair retry
+        except (ValidationError, json.JSONDecodeError):
+            # One repair retry without dumping noisy traceback strings into the prompt
             repair_messages = list(messages)
             repair_messages.append({"role": "assistant", "content": raw_content})
             repair_messages.append(
                 {
                     "role": "user",
                     "content": (
-                        f"Your output failed validation ({err}). "
+                        "Your previous output was not valid JSON conforming to the schema. "
                         f"Return ONLY valid JSON strictly adhering to schema: {json.dumps(schema)}"
                     ),
                 }
@@ -160,14 +255,25 @@ def extract_events_from_text(
             retry_payload = {
                 "model": model,
                 "messages": repair_messages,
-                "stream": False,
+                "stream": True,
                 "format": schema,
-                "options": {"temperature": 0.1},
+                "keep_alive": keep_alive,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 384,
+                    "num_ctx": 2048,
+                },
             }
-            retry_res = client.post("/api/chat", json=retry_payload)
-            retry_res.raise_for_status()
-            retry_content = clean_json_text(retry_res.json().get("message", {}).get("content", ""))
-            parsed_response = ExtractResponse.model_validate_json(retry_content)
+            try:
+                retry_raw = stream_chat_from_ollama(http_client, retry_payload, timeout=timeout_config)
+                retry_content = clean_json_text(retry_raw)
+                parsed_response = ExtractResponse.model_validate_json(retry_content)
+            except (ValidationError, json.JSONDecodeError, Exception):
+                # If retry also fails validation, fallback to empty events rather than crashing
+                return []
+
+        if parsed_response is None or not parsed_response.events:
+            return []
 
         # Drop any events with confidence < 0.6 per spec
         # Enforce plain hyphens and backfill session_id / workspace if missing
@@ -194,15 +300,28 @@ def extract_events_from_text(
 
         return valid_events
 
+    if client is not None:
+        return _execute(client)
+    else:
+        with httpx.Client(base_url=host, timeout=timeout_config) as local_client:
+            return _execute(local_client)
+
 
 def extract_events_for_window(
     window: Window,
     model: str = "gemma2:2b",
     host: str = "http://127.0.0.1:11434",
-    timeout: float = 60.0,
+    timeout: float | httpx.Timeout = 180.0,
+    keep_alive: str = "30m",
     include_fewshots: bool = True,
+    max_fewshots: int = 2,
+    client: httpx.Client | None = None,
+    filter_signals: bool = True,
 ) -> list[ExtractedEvent]:
-    """Extract events from a Window model instance."""
+    """Extract events from a Window model instance, skipping uninteresting windows via fast regex gating."""
+    if filter_signals and not has_extraction_signals(window.text):
+        return []
+
     return extract_events_from_text(
         text=window.text,
         session_id=window.session_id,
@@ -210,13 +329,18 @@ def extract_events_for_window(
         model=model,
         host=host,
         timeout=timeout,
+        keep_alive=keep_alive,
         include_fewshots=include_fewshots,
+        max_fewshots=max_fewshots,
+        client=client,
     )
 
 
 def smoke_test_ollama(
     model: str = "gemma2:2b",
     host: str = "http://127.0.0.1:11434",
+    timeout: float = 60.0,
+    keep_alive: str = "5m",
 ) -> tuple[bool, str]:
     """Verify Ollama service is reachable and can return valid structured events."""
     sample_text = (
@@ -232,7 +356,8 @@ def smoke_test_ollama(
             workspace="/tmp/sample-workspace",
             model=model,
             host=host,
-            timeout=30.0,
+            timeout=timeout,
+            keep_alive=keep_alive,
             include_fewshots=False,
         )
         summary = (

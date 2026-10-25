@@ -105,3 +105,28 @@ def test_extract_events_repair_retry_on_bad_json():
         assert mock_post.call_count == 2
         assert len(events) == 1
         assert events[0].normalized == "Use SQLite for cache"
+
+
+def test_extract_events_double_failure_fallback_empty():
+    bad_res1 = MagicMock()
+    bad_res1.status_code = 200
+    bad_res1.json.return_value = {"message": {"content": "This is broken JSON {"}}
+
+    bad_res2 = MagicMock()
+    bad_res2.status_code = 200
+    bad_res2.json.return_value = {
+        "message": {
+            "content": "text\njson.decoder.JSONDecodeError: Expecting property name enclosed in double"
+        }
+    }
+
+    with patch("httpx.Client.post", side_effect=[bad_res1, bad_res2]) as mock_post:
+        events = extract_events_from_text("sample input", session_id="sess-double-fail")
+        assert mock_post.call_count == 2
+        assert events == []
+
+
+def test_clean_json_text_no_json_braces():
+    raw_error = "text\njson.decoder.JSONDecodeError: Expecting property name enclosed in double"
+    cleaned = clean_json_text(raw_error)
+    assert cleaned == '{"events": []}'
